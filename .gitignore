@@ -1,0 +1,51 @@
+# ==============================================================================
+# ZERO-LEAK REPOSITORY PROTECTION (.gitignore)
+# ==============================================================================
+
+# Data & Cache Protection (Raw provider feeds, tournament dumps & video)
+data/*
+!data/calibration/
+!data/calibration/**
+!data/.gitkeep
+!data/video_raw/clips/clip_maignan_pass_0708_0720_clean.mp4
+!data/video_raw/clips/clip_maignan_pass_2500_2525_clean.mp4
+!data/video_raw/clips/clip_maignan_pass_7818_7828_clean.mp4
+*.parquet
+*.pkl
+
+# Internal Reports & Logs
+reports/*
+!reports/.gitkeep
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.log
+
+# Environment & Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.DS_Store
+**/.DS_Store
+
+# Large Model Weights & Raw Video
+*.pt
+*.onnx
+data/video_raw/
+
+# Archived Historical Research & Prototypes
+archive/
+docs/
+
+# Internal Agent Framework, Skills & Specifications
+.agents/
+skills/
+AGENTS.md
+PROJECT_SPEC.md
+CORE_BELIEFS.md
+*SPEC*.md
+*AGENT*.md
