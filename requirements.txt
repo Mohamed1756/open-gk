@@ -3,6 +3,7 @@ pydantic>=2.0.0
 torch>=2.2.0
 torch-geometric>=2.5.0
 einops>=0.7.0
+ultralytics>=8.2.0
 
 # Football Tracking & Sports Analytics Data
 kloppy>=3.14.0
