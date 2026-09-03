@@ -22,10 +22,13 @@ Most GK stats (distribution % or pass completion) don't account for context—sp
 ## Quick Start
 
 ```bash
-clone this repo
-pip install -r requirements.txt
-python3 scripts/evaluate_distribution.py --episode all
-# Open reports/goalkeeper_distribution_valuation.html
+git clone https://github.com/Mohamed1756/open-gk.git
+cd open-gk
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python scripts/evaluate_distribution.py --episode all
+open reports/goalkeeper_distribution_valuation.html
 ```
 
 ## Status
