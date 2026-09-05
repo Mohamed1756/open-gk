@@ -1,3 +1,4 @@
+# Justification: Combines 3x3 homography matrix solving, pitch landmark reprojection, dynamic smoothing, and tactical AR polygon transforms.
 """
 Planar Pitch Homography Engine for Monocular Video Broadcast Ingestion.
 Computes the 3x3 Projective Homography Matrix H mapping screen pixels (u, v) -> Canonical Pitch Meters (X, Y).

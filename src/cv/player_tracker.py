@@ -1,3 +1,4 @@
+# Justification: Combines Kalman filtering state, Hungarian assignment, ball-carrier snapping, and pitch boundary filtering.
 """
 Multi-Object Temporal Video Tracking Engine (Kalman Filter + Hungarian Association).
 Maintains persistent player, referee, and single match ball track identities across continuous video frames at 25 Hz.
