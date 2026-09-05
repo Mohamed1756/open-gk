@@ -5,6 +5,7 @@ from scripts.evaluate_distribution import (
     _actors_from_entities,
     _build_duel_payload,
     _pose_torso_facing,
+    _shared_fate_notes,
 )
 
 
@@ -153,6 +154,71 @@ def test_duel_payload_empty_without_records():
         [], 0, 25.0, None, PitchPoint(x=0.0, y=0.0), [], [], 1.0
     )
     assert payload == {"duels": {}, "releasedOutlet": None, "duelOutcome": None}
+
+
+def _window_records(people_fn, n=11):
+    return [
+        {
+            "frame": fi,
+            "timestamp_s": round(fi / 25.0, 3),
+            "entities": people_fn(fi),
+        }
+        for fi in range(n)
+    ]
+
+
+def _p(tid, label, x, y):
+    return {
+        "track_id": tid,
+        "class_name": "person",
+        "team_label": label,
+        "pitch_xy": [x, y],
+        "pitch_vel_ms": [0.0, 0.0],
+        "screen_uv": [100.0, 200.0],
+        "bbox": [90.0, 150.0, 130.0, 250.0],
+        "pitch_valid": True,
+    }
+
+
+def _same_lane_people(fi):
+    return [
+        _p(1, "own", 100.0, 29.0),
+        _p(9, "own", 86.0, 28.0),
+        _p(5, "own", 86.0, 30.0),
+        _p(7, "opp", 93.0, 29.0),
+    ]
+
+
+def _split_mark_people(fi):
+    return [
+        _p(1, "own", 100.0, 29.0),
+        _p(9, "own", 86.0, 28.0),
+        _p(5, "own", 86.0, 30.0),
+        _p(7, "opp", 93.0, 28.2),
+        _p(8, "opp", 93.0, 29.8),
+    ]
+
+
+def test_shared_fate_flags_same_lane_same_presser():
+    records = _window_records(_same_lane_people)
+    shared = _shared_fate_notes(records, list(range(11)), 1, [9, 5], (100.0, 29.0))
+    assert shared[9] == [5]
+    assert shared[5] == [9]
+
+
+def test_shared_fate_clean_with_split_marking():
+    records = _window_records(_split_mark_people)
+    shared = _shared_fate_notes(records, list(range(11)), 1, [9, 5], (100.0, 29.0))
+    assert shared[9] == []
+    assert shared[5] == []
+
+
+def test_shared_fate_empty_without_frames_or_outlets():
+    assert _shared_fate_notes([], [], 1, [9, 5], (100.0, 29.0)) == {
+        9: [],
+        5: [],
+    }
+    assert _shared_fate_notes([], [0], 1, [9], (100.0, 29.0)) == {9: []}
 
 
 def test_duel_payload_no_release_when_keeper_holds():

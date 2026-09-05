@@ -88,7 +88,14 @@ from src.models.distribution.first_touch import (
 from src.models.distribution.frontier import compute_decision_frontier
 from src.models.pressing.types import PressingActor, PressingSnapshot
 from src.models.pressing.units import cluster_lines, press_state
-from src.models.pressing.arrival import arrival_margin, flight_time_s, lead_target
+from src.models.pressing.arrival import (
+    arrival_margin,
+    flight_time_s,
+    lead_target,
+    presser_arrival_s,
+    presser_engagement_latency_s,
+)
+from src.models.distribution.correlation import find_shared_fate
 from src.models.pressing.duels import track_duel
 from src.models.pressing.matchup import assign_pressers
 from src.models.pressing.readiness import receiver_readiness
@@ -1061,6 +1068,7 @@ def project_decision_to_screen(
                 "xp": opt["xp_completion_prob"],
                 "path_score": opt["path_score"],
                 "visual_label": opt["visual_label"],
+                "shared_fate": [int(t) for t in opt.get("shared_fate_with", [])],
             }
         )
     cone_px = [anchor_px]
@@ -1137,6 +1145,73 @@ def _duel_team(tid: int, own_ids: set, opp_ids: set) -> str:
     if tid in opp_ids:
         return "opp"
     return "other"
+
+
+def _shared_fate_notes(
+    tracking_records: list[dict[str, Any]],
+    frame_ids: list[int],
+    passer_track_id: Optional[int],
+    outlet_ids: list[int],
+    passer_xy_decision: tuple[float, float],
+) -> Dict[int, list[int]]:
+    """Shared-fate outlets over complete frames only.
+
+    Passer anchor is the decision-frame position (the keeper holds the ball,
+    so drift is negligible); frames missing any party are skipped rather than
+    interpolated. Notes only: scores never move here.
+    """
+    if len(frame_ids) < 2 or len(outlet_ids) < 2:
+        return {tid: [] for tid in outlet_ids}
+    own = set(outlet_ids)
+    if passer_track_id is not None:
+        own.add(int(passer_track_id))
+    leads: Dict[int, list] = {tid: [] for tid in outlet_ids}
+    press: Dict[int, list] = {tid: [] for tid in outlet_ids}
+    for fi in frame_ids:
+        ents = {
+            int(e["track_id"]): e
+            for e in tracking_records[fi]["entities"]
+            if e.get("class_name") == "person"
+            and not is_official_label(e.get("team_label", ""))
+        }
+        if passer_track_id is None or int(passer_track_id) not in ents:
+            continue
+        if any(tid not in ents for tid in outlet_ids):
+            continue
+        p_xy = ents[int(passer_track_id)]["pitch_xy"]
+        passer_pt = PitchPoint(x=p_xy[0], y=p_xy[1])
+        opps = [
+            e
+            for tid, e in ents.items()
+            if tid not in own and e.get("pitch_valid", True)
+        ]
+        rows: Dict[int, tuple] = {}
+        for tid in outlet_ids:
+            e = ents[tid]
+            vel = e.get("pitch_vel_ms", [0.0, 0.0])
+            rec = PitchPoint(x=e["pitch_xy"][0], y=e["pitch_xy"][1])
+            dist = math.hypot(rec.x - passer_pt.x, rec.y - passer_pt.y)
+            lead = lead_target(rec, (float(vel[0]), float(vel[1])), flight_time_s(dist))
+            best, best_cost = None, math.inf
+            for o in opps:
+                ov = o.get("pitch_vel_ms", [0.0, 0.0])
+                opp = PressingActor(
+                    track_id=int(o["track_id"]),
+                    team_id="opp",
+                    pos_m=PitchPoint(x=o["pitch_xy"][0], y=o["pitch_xy"][1]),
+                    vel_ms=(float(ov[0]), float(ov[1])),
+                )
+                engage, _ = presser_engagement_latency_s(opp, lead, passer_pt)
+                cost, _ = presser_arrival_s(opp, lead, engagement_latency_s=engage)
+                if cost < best_cost:
+                    best, best_cost = int(o["track_id"]), cost
+            rows[tid] = ((lead.x, lead.y), best)
+        for tid, (lead_xy, pid) in rows.items():
+            leads[tid].append(lead_xy)
+            press[tid].append(pid)
+    if not leads[outlet_ids[0]]:
+        return {tid: [] for tid in outlet_ids}
+    return find_shared_fate(outlet_ids, passer_xy_decision, leads, press)
 
 
 def _build_duel_payload(
@@ -2004,6 +2079,28 @@ def evaluate_match_episode(
         float(match.attack_dir_x),
     )
 
+    shared_window = list(
+        range(
+            max(0, int(decision_frame_idx) - int(3.5 * fps)),
+            int(decision_frame_idx) + 1,
+        )
+    )
+    shared_map = _shared_fate_notes(
+        tracking_records,
+        shared_window,
+        passer_track_id,
+        [int(o["track_id"]) for o in decision_evaluation],
+        (float(passer_pos.x), float(passer_pos.y)),
+    )
+    for opt in decision_evaluation:
+        partners = shared_map.get(int(opt["track_id"]), [])
+        opt["shared_fate_with"] = partners
+        if partners:
+            opt["bottleneck_diagnostic"] = (
+                f"{opt['bottleneck_diagnostic']} "
+                f"(shares fate with {', '.join(f'#{p}' for p in partners)})"
+            )
+
     opt_rows = []
     for opt in decision_evaluation:
         badge = (
@@ -2704,6 +2801,19 @@ def generate_multi_episode_dashboard_html(
                             const ty2 = Math.max(14, ty - 14);
                             vSvg += `<rect x="${{tx + 10}}" y="${{ty2 - 11}}" width="${{Math.min(230, tag.length * 6.4 + 12)}}" height="16" fill="#0a0f1d" opacity="0.85" rx="3"/>`;
                             vSvg += `<text x="${{tx + 16}}" y="${{ty2 + 1}}" fill="${{lane.grade_color}}" font-size="10" font-weight="bold">${{tag}}</text>`;
+                        }}
+                    }}
+                }}
+                if (!vidLanesToggle || vidLanesToggle.checked) {{
+                    for (const lane of ep.decisionPx.lanes) {{
+                        if (!lane.shared_fate || lane.shared_fate.length === 0) continue;
+                        const [sx, sy] = lane.target_px;
+                        for (const partner of lane.shared_fate) {{
+                            if (partner <= lane.track_id) continue;
+                            const other = ep.decisionPx.lanes.find(l => l.track_id === partner);
+                            if (!other) continue;
+                            const [ox, oy] = other.target_px;
+                            vSvg += `<line x1="${{sx}}" y1="${{sy}}" x2="${{ox}}" y2="${{oy}}" stroke="#94a3b8" stroke-width="1" stroke-dasharray="2 4" opacity="0.5"><title>Shared fate #${{lane.track_id}} ↔ #${{partner}}</title></line>`;
                         }}
                     }}
                 }}
