@@ -3,13 +3,27 @@ Goalkeeper Distribution Valuation Engine (Module M7).
 Evaluates passing risk/reward conditioned on opponent press intensity and the Buildup +1 dynamic.
 """
 
+import math
 from typing import List, Dict, Any
 import numpy as np
 from pydantic import BaseModel, Field
 
+from src.config import PITCH_LENGTH_METERS, GOAL_Y_CENTER
 from src.core.geometry import PitchPoint, compute_cover_shadow
 from src.core.schemas import DistributionSituation
 from src.core.types import DistributionType, DistributionOutcome
+from src.physics.gk_constraints import (
+    CENTRAL_TURNOVER_PEAK_XG,
+    CENTRAL_ZONE_SIGMA_X_M,
+    CENTRAL_ZONE_SIGMA_Y_M,
+    TURNOVER_HAZARD_FLOOR_XG,
+    EXIT_AFFORDANCE_PINNED_MULT,
+    EXIT_AFFORDANCE_BASE_MULT,
+    EXIT_AFFORDANCE_PER_LANE,
+    EXIT_AFFORDANCE_MAX_MULT,
+    GK_PRESS_URGENCY_RADIUS_M,
+    GK_PRESS_CRITICAL_RADIUS_M,
+)
 
 
 class PassOptionEvaluation(BaseModel):
@@ -58,7 +72,7 @@ class DistributionEvaluator:
         """
         # Baseline logistic decay with length
         if dist_type in [DistributionType.SHORT_PASS, DistributionType.THROW]:
-            base_logit = 3.2 - 0.08 * min(pass_length_m, 35.0)
+            base_logit = 3.6 - 0.075 * min(pass_length_m, 35.0)
         elif dist_type == DistributionType.GOAL_KICK:
             base_logit = 2.0 - 0.045 * min(pass_length_m, 70.0)
         else:  # PUNT or LONG_PASS
@@ -80,41 +94,96 @@ class DistributionEvaluator:
         origin: PitchPoint,
         target: PitchPoint,
         opponents_pressed_count: int,
+        attack_dir_x: float = 1.0,
+        exit_lanes_count: int = 0,
     ) -> float:
         """
-        Computes the expected progression threat (xT / possession value) created by the pass.
+        Computes expected progression threat (xT / possession value) created by the pass,
+        scaling by bypassed pressers and downstream receiver exit affordance lanes.
         """
-        # Progression delta along X-axis towards opponent goal
-        delta_x_m = max(0.0, target.x - origin.x)
+        if attack_dir_x >= 0:
+            delta_x_m = max(0.0, target.x - origin.x)
+        else:
+            delta_x_m = max(0.0, origin.x - target.x)
 
-        # Territory value: moving out of defensive 18-yard box into midfield / final third
-        base_threat = (delta_x_m / 105.0) * 0.05
-
-        # Buildup +1 multiplier: breaking lines with pressing opponents behind
+        base_threat = (delta_x_m / PITCH_LENGTH_METERS) * 0.05
         press_bonus = min(0.04, opponents_pressed_count * 0.012)
-        total_threat = base_threat + press_bonus
 
-        return float(np.clip(total_threat, 0.001, 0.10))
+        # Exit affordance multiplier: more unblocked progressive exit lanes amplify value
+        if exit_lanes_count == 0:
+            exit_mult = EXIT_AFFORDANCE_PINNED_MULT
+        else:
+            exit_mult = min(
+                EXIT_AFFORDANCE_MAX_MULT,
+                EXIT_AFFORDANCE_BASE_MULT + EXIT_AFFORDANCE_PER_LANE * exit_lanes_count,
+            )
+
+        total_threat = (base_threat + press_bonus) * exit_mult
+        return float(np.clip(total_threat, 0.001, 0.15))
 
     def compute_turnover_risk_cost(
         self,
         target: PitchPoint,
+        attack_dir_x: float = 1.0,
     ) -> float:
         """
-        Computes the expected danger / conceded xG if the pass is turned over.
-        Turnovers centrally near own goal (X < 25m, 20m < Y < 48m) are catastrophic.
+        Computes continuous 2D spatial turnover hazard (conceded xG).
+        Centrally aligned turnovers near own goal carry maximum hazard (up to 0.55 xG),
+        decaying smoothly via a 2D Gaussian density toward the touchline and upfield.
         """
-        dist_to_own_goal_m = float(np.hypot(target.x, target.y - 34.0))
-
-        if dist_to_own_goal_m < 20.0:
-            # Danger box turnover
-            return float(np.clip(0.55 - 0.015 * dist_to_own_goal_m, 0.20, 0.65))
-        elif target.x < 45.0:
-            # Midfield defensive half turnover
-            return float(np.clip(0.20 - 0.003 * target.x, 0.06, 0.20))
+        if attack_dir_x >= 0:
+            d_x_m = max(0.0, target.x)
         else:
-            # Opponent half aerial/sideline turnover
-            return 0.03
+            d_x_m = max(0.0, PITCH_LENGTH_METERS - target.x)
+
+        d_y_m = abs(target.y - GOAL_Y_CENTER)
+
+        exponent = -(
+            (d_x_m**2) / (2.0 * (CENTRAL_ZONE_SIGMA_X_M**2))
+            + (d_y_m**2) / (2.0 * (CENTRAL_ZONE_SIGMA_Y_M**2))
+        )
+        hazard = CENTRAL_TURNOVER_PEAK_XG * math.exp(exponent)
+        return float(max(TURNOVER_HAZARD_FLOOR_XG, min(0.65, hazard)))
+
+    def compute_pressure_relief_value(
+        self,
+        origin_hazard: float,
+        target_hazard: float,
+        gk_press_dist_m: float,
+        closing_speed_ms: float = 0.0,
+    ) -> float:
+        """
+        Computes the possession safety relief (conceded xG delta saved) achieved by releasing
+        the ball away from goalkeeper pressure into a safer pitch zone.
+        """
+        d_eff = max(0.0, gk_press_dist_m - closing_speed_ms * 0.35)
+        if d_eff >= GK_PRESS_URGENCY_RADIUS_M:
+            urgency = 0.0
+        elif d_eff <= GK_PRESS_CRITICAL_RADIUS_M:
+            urgency = 1.0
+        else:
+            urgency = (GK_PRESS_URGENCY_RADIUS_M - d_eff) / (
+                GK_PRESS_URGENCY_RADIUS_M - GK_PRESS_CRITICAL_RADIUS_M
+            )
+
+        baseline_hazard = origin_hazard * urgency
+        relief = max(0.0, baseline_hazard - target_hazard)
+        return float(relief)
+
+    def compute_net_distribution_ev(
+        self,
+        retention_xp: float,
+        prog_threat: float,
+        target_turnover_cost: float,
+        relief_value: float = 0.0,
+    ) -> float:
+        """
+        Computes net expected possession value delta (action value relative to baseline risk).
+        """
+        ev = (retention_xp * (prog_threat + relief_value)) - (
+            (1.0 - retention_xp) * target_turnover_cost
+        )
+        return float(ev)
 
     def evaluate_distribution(
         self,

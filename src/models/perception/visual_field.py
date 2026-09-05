@@ -1,3 +1,4 @@
+# Justification: Combines visual frustum cones, line-of-sight ray occlusion, chipped clearance physics, and spatial memory buffers.
 """
 Visual Field and Perception Frustum Engine.
 Models human gaze visual cones, line-of-sight occlusions,
@@ -9,6 +10,10 @@ import math
 from typing import List, Tuple, Dict, Optional
 
 from src.core.geometry import PitchPoint
+from src.physics.gk_constraints import (
+    CHIPPED_PASS_APEX_M,
+    DEFENDER_MAX_JUMP_REACH_M,
+)
 
 
 def wrap_angle_rad(angle_rad: float) -> float:
@@ -90,24 +95,77 @@ def compute_los_occlusion(
     return False, None
 
 
+def evaluate_chipped_clearance(
+    passer_pos: PitchPoint,
+    target_pos: PitchPoint,
+    obstacle_pos: PitchPoint,
+    apex_m: float = CHIPPED_PASS_APEX_M,
+    jump_reach_m: float = DEFENDER_MAX_JUMP_REACH_M,
+) -> Tuple[bool, float]:
+    """Evaluates whether an aerial chipped pass cleanly clears an intermediate obstacle.
+
+    Models parabolic elevation: z(s) = 4 * apex_m * s * (1 - s), where s =
+    d_obs / d_pass.
+    Returns (is_cleared, clearance_height_m).
+    """
+    dx = target_pos.x - passer_pos.x
+    dy = target_pos.y - passer_pos.y
+    pass_dist = math.hypot(dx, dy)
+    if pass_dist < 1e-3:
+        return False, 0.0
+
+    vox_x = obstacle_pos.x - passer_pos.x
+    vox_y = obstacle_pos.y - passer_pos.y
+    # Fractional distance along pass corridor
+    s = (vox_x * dx + vox_y * dy) / (pass_dist * pass_dist)
+
+    # Only intermediate obstacles can be cleared by parabolic apex;
+    # obstacles right at the receiver's boots (s > 0.85) contest reception directly.
+    if not (0.10 <= s <= 0.85):
+        return False, 0.0
+
+    # Parabolic elevation at fractional distance s
+    z_m = 4.0 * apex_m * s * (1.0 - s)
+    is_cleared = z_m > jump_reach_m
+    return is_cleared, round(z_m, 2)
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
 def update_spatial_memory_buffer(
     last_seen_timestamps_s: Dict[int, float],
     currently_visible_ids: List[int],
     current_time_s: float,
     decay_tau_s: float = 2.0,
     memory_horizon_s: float = 3.5,
+    closing_press_speeds: Optional[Dict[int, float]] = None,
+    tactical_prior_floor: float = 0.0,
+    visible_confidences: Optional[Dict[int, float]] = None,
+    prior_weights: Optional[Dict[int, float]] = None,
 ) -> Tuple[Dict[int, float], Dict[int, float]]:
     """
     Updates spatial memory buffer given current visual perception.
     Returns (updated_last_seen_timestamps, current_memory_weights).
-    Weight = 1.0 when currently visible, decaying exponentially to 0.0 after memory_horizon.
+    Weight = gaze confidence when currently visible, decaying exponentially to
+    0.0 after memory_horizon. Decay scales from the weight at last sighting
+    (w0 * exp(-elapsed / tau)), so a noisy 0.3-confidence glimpse never outranks
+    itself a second later. Omitting visible_confidences/prior_weights reproduces
+    the legacy assume-perfect-gaze behavior exactly.
+    Accelerates decay when closing_press_speeds indicate dynamic closing pressure (>= 2.5 m/s).
     """
     updated_timestamps: Dict[int, float] = dict(last_seen_timestamps_s)
     memory_weights: Dict[int, float] = {}
 
     for tid in currently_visible_ids:
         updated_timestamps[tid] = current_time_s
-        memory_weights[tid] = 1.0
+        conf = (
+            _clamp01(visible_confidences.get(tid, 1.0))
+            if visible_confidences is not None
+            else 1.0
+        )
+        memory_weights[tid] = round(conf, 3)
 
     # Process remembered but not currently visible targets
     expired_ids = []
@@ -118,10 +176,22 @@ def update_spatial_memory_buffer(
         elapsed_s = current_time_s - last_seen
         if elapsed_s > memory_horizon_s:
             expired_ids.append(tid)
-            memory_weights[tid] = 0.0
+            memory_weights[tid] = tactical_prior_floor
         else:
-            weight = math.exp(-elapsed_s / decay_tau_s)
-            memory_weights[tid] = round(float(weight), 3)
+            eff_tau = decay_tau_s
+            if closing_press_speeds and tid in closing_press_speeds:
+                v_close = closing_press_speeds[tid]
+                if v_close >= 2.5:
+                    # Dynamic press accelerates staleness of working memory
+                    eff_tau = decay_tau_s / (1.0 + 0.4 * (v_close - 2.5))
+
+            w0 = (
+                _clamp01(prior_weights.get(tid, 1.0))
+                if prior_weights is not None
+                else 1.0
+            )
+            weight = w0 * math.exp(-elapsed_s / max(0.2, eff_tau))
+            memory_weights[tid] = round(max(tactical_prior_floor, float(weight)), 3)
 
     for tid in expired_ids:
         del updated_timestamps[tid]
@@ -129,10 +199,12 @@ def update_spatial_memory_buffer(
     return updated_timestamps, memory_weights
 
 
-SCAN_KNOWN_THRESHOLD = 0.5
+SCAN_KNOWN_THRESHOLD = 0.50
+SCAN_CONFIRMED_THRESHOLD = 0.70  # Recent confirmed scan unlocks pass with zero penalty
 SCAN_KNOWN_PENALTY = 10.0
 OUT_OF_VISION_PENALTY = 20.0
 VISION_LOGIT_BASE = 0.55
+TACTICAL_PRIOR_FLOOR = 0.25  # Coached positional prior floor for structural outlets
 
 
 def facing_to_ball(
@@ -154,20 +226,205 @@ def visible_person_ids(
     facing_rad: float,
     persons: List[Tuple[int, Tuple[float, float]]],
     fov_deg: float = 140.0,
+    obstacles: Optional[List[PitchPoint]] = None,
+    max_obstacle_check_dist_m: float = 3.5,
 ) -> List[int]:
+    """
+    Identifies persons inside observer's visual cone, accounting for close foreground occlusions.
+    """
     observer = PitchPoint(x=observer_xy[0], y=observer_xy[1])
     visible = []
     for tid, xy in persons:
-        in_cone, _ = is_in_visual_cone(
-            observer, facing_rad, PitchPoint(x=xy[0], y=xy[1]), fov_deg=fov_deg
-        )
+        target_pt = PitchPoint(x=xy[0], y=xy[1])
+        in_cone, _ = is_in_visual_cone(observer, facing_rad, target_pt, fov_deg=fov_deg)
         if in_cone:
+            if obstacles:
+                is_blocked, _ = compute_los_occlusion(
+                    observer,
+                    target_pt,
+                    obstacles,
+                    obstacle_radius_m=0.75,
+                    max_check_dist_m=max_obstacle_check_dist_m,
+                )
+                if is_blocked:
+                    continue
             visible.append(tid)
     return visible
 
 
 def vision_logit_penalty(memory_weight: float) -> float:
+    """
+    Computes logit penalty for vision awareness.
+    If memory weight >= 0.70 (recent confirmed scan), penalty is 0.0 (unlocking disguised pass).
+    Otherwise decays smoothly with unverified awareness.
+    """
+    if memory_weight >= SCAN_CONFIRMED_THRESHOLD:
+        return 0.0
     return VISION_LOGIT_BASE * (1.0 - max(0.0, min(1.0, memory_weight)))
+
+
+def accumulate_window_scan_memory(
+    scan_sequence: List[
+        Tuple[float, float, Tuple[float, float], List[Tuple[int, Tuple[float, float]]]]
+    ],
+    decay_tau_s: float = 2.0,
+    memory_horizon_s: float = 3.5,
+    fov_deg: float = 140.0,
+    obstacles: Optional[List[PitchPoint]] = None,
+    closing_press_speeds: Optional[Dict[int, float]] = None,
+    tactical_prior_floor: float = 0.0,
+    gaze_confidences: Optional[List[float]] = None,
+) -> Tuple[Dict[int, float], Dict[int, float]]:
+    """
+    Accumulates spatial memory across a temporal sequence of pre-decision scan frames.
+    Only frames with a measured gaze angle belong in scan_sequence; frames without
+    a pose measurement must advance decay with an empty visible set instead of a
+    fabricated fallback gaze. Press-decay wiring is deferred (see notes).
+
+    Args:
+        scan_sequence: List of tuples (timestamp_s, gaze_angle_rad, observer_xy, persons_list)
+            where persons_list is List[Tuple[track_id, (x_m, y_m)]].
+        decay_tau_s: Exponential decay time constant in seconds.
+        memory_horizon_s: Memory cutoff threshold in seconds.
+        fov_deg: Field of view cone in degrees (default 140.0).
+        obstacles: Close foreground obstacles capable of occluding gaze rays.
+        closing_press_speeds: Optional mapping of track_id to closing presser speeds.
+        tactical_prior_floor: Baseline memory weight floor.
+        gaze_confidences: Optional per-frame gaze confidence aligned with
+            scan_sequence; visible weights are discounted by it.
+
+    Returns:
+        (last_seen_timestamps_s, final_memory_weights)
+    """
+    _, timestamps, weights = accumulate_window_scan_windows(
+        scan_sequence,
+        decay_tau_s=decay_tau_s,
+        memory_horizon_s=memory_horizon_s,
+        fov_deg=fov_deg,
+        obstacles=obstacles,
+        closing_press_speeds=closing_press_speeds,
+        tactical_prior_floor=tactical_prior_floor,
+        gaze_confidences=gaze_confidences,
+    )
+    return timestamps, weights
+
+
+def accumulate_window_scan_windows(
+    scan_sequence: List[
+        Tuple[float, float, Tuple[float, float], List[Tuple[int, Tuple[float, float]]]]
+    ],
+    decay_tau_s: float = 2.0,
+    memory_horizon_s: float = 3.5,
+    fov_deg: float = 140.0,
+    obstacles: Optional[List[PitchPoint]] = None,
+    closing_press_speeds: Optional[Dict[int, float]] = None,
+    tactical_prior_floor: float = 0.0,
+    gaze_confidences: Optional[List[float]] = None,
+) -> Tuple[Dict[int, float], Dict[int, float], Dict[int, float]]:
+    """
+    Same accumulation as accumulate_window_scan_memory but also records the first
+    time each track was seen, so callers can build per-outlet scan windows
+    (first_seen_s, last_seen_s, weight) instead of a single min-max angle span.
+    """
+    if gaze_confidences is not None and len(gaze_confidences) != len(scan_sequence):
+        raise ValueError("gaze_confidences must align with scan_sequence.")
+    first_seen: Dict[int, float] = {}
+    timestamps: Dict[int, float] = {}
+    weights: Dict[int, float] = {}
+
+    for k, (t_s, gaze_rad, obs_xy, persons) in enumerate(scan_sequence):
+        visible_ids = visible_person_ids(
+            observer_xy=obs_xy,
+            facing_rad=gaze_rad,
+            persons=persons,
+            fov_deg=fov_deg,
+            obstacles=obstacles,
+        )
+        for tid in visible_ids:
+            if tid not in first_seen:
+                first_seen[tid] = t_s
+        frame_conf = gaze_confidences[k] if gaze_confidences is not None else 1.0
+        timestamps, weights = update_spatial_memory_buffer(
+            last_seen_timestamps_s=timestamps,
+            currently_visible_ids=visible_ids,
+            current_time_s=t_s,
+            decay_tau_s=decay_tau_s,
+            memory_horizon_s=memory_horizon_s,
+            closing_press_speeds=closing_press_speeds,
+            tactical_prior_floor=tactical_prior_floor,
+            visible_confidences={tid: frame_conf for tid in visible_ids},
+            prior_weights=weights,
+        )
+
+    return first_seen, timestamps, weights
+
+
+def summarize_scan_windows(
+    first_seen_s: Dict[int, float],
+    last_seen_s: Dict[int, float],
+    weights: Dict[int, float],
+    decision_time_s: float,
+) -> Dict[int, Dict[str, float | str]]:
+    """
+    Builds one scan window per track from measured gaze frames only.
+    Status tiers reuse SCAN_CONFIRMED_THRESHOLD (0.70) and SCAN_KNOWN_THRESHOLD (0.50).
+    """
+    windows: Dict[int, Dict[str, float | str]] = {}
+    for tid, weight in weights.items():
+        last = last_seen_s.get(tid, first_seen_s.get(tid, decision_time_s))
+        first = first_seen_s.get(tid, last)
+        w = max(0.0, min(1.0, float(weight)))
+        if w >= SCAN_CONFIRMED_THRESHOLD:
+            status = "CONFIRMED"
+        elif w >= SCAN_KNOWN_THRESHOLD:
+            status = "KNOWN"
+        elif w > 0.0:
+            status = "STALE"
+        else:
+            status = "EXPIRED"
+        windows[tid] = {
+            "first_seen_s": round(float(first), 2),
+            "last_seen_s": round(float(last), 2),
+            "age_s": round(max(0.0, decision_time_s - float(last)), 2),
+            "weight": round(w, 3),
+            "status": status,
+        }
+    return windows
+
+
+def merge_swept_cones(
+    gaze_samples_rad: List[float], half_fov_rad: float
+) -> List[Tuple[float, float]]:
+    """
+    Merges per-frame gaze cones into a union of angular intervals on [-pi, pi].
+    Each sample covers [gaze - half_fov, gaze + half_fov]; wrap-around samples are
+    split so the union never claims the unscanned gap between extremes.
+    """
+    if not gaze_samples_rad:
+        return []
+    spans: List[Tuple[float, float]] = []
+    for g in gaze_samples_rad:
+        start = g - half_fov_rad
+        end = g + half_fov_rad
+        while start < -math.pi:
+            start += 2.0 * math.pi
+            end += 2.0 * math.pi
+        while start > math.pi:
+            start -= 2.0 * math.pi
+            end -= 2.0 * math.pi
+        if end > math.pi:
+            spans.append((start, math.pi))
+            spans.append((-math.pi, end - 2.0 * math.pi))
+        else:
+            spans.append((start, end))
+    spans.sort()
+    merged: List[List[float]] = [[spans[0][0], spans[0][1]]]
+    for start, end in spans[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(round(s, 4), round(e, 4)) for s, e in merged]
 
 
 def evaluate_pressing_approach_cut(
@@ -177,13 +434,13 @@ def evaluate_pressing_approach_cut(
     presser_vel_xy_ms: tuple[float, float],
     pass_speed_ms: float = 19.0,
     prep_latency_s: float = 0.25,
-    time_horizon_s: float = 1.2,
+    time_horizon_s: Optional[float] = None,
     corridor_width_m: float = 1.5,
     interception_time_tolerance_s: float = 0.35,
 ) -> tuple[bool, float, float]:
-    """
-    Evaluates whether the pressing defender's running trajectory will cut the passing lane
-    with spatiotemporal arrival synchronization.
+    """Evaluates whether the pressing defender's running trajectory will cut the
+
+    passing lane with spatiotemporal arrival synchronization.
 
     Calculates:
     1. Spatial proximity to passing corridor: perp_dist <= corridor_width_m.
@@ -213,8 +470,13 @@ def evaluate_pressing_approach_cut(
     min_time_delta = 99.0
     is_cutting = False
 
-    steps = 16
-    dt = time_horizon_s / steps
+    horizon = (
+        time_horizon_s
+        if time_horizon_s is not None
+        else max(1.2, prep_latency_s + (ray_len / max(5.0, pass_speed_ms)))
+    )
+    steps = max(16, int(horizon * 16))
+    dt = horizon / steps
 
     for step in range(steps + 1):
         t_presser = step * dt

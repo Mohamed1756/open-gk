@@ -3,7 +3,7 @@ Minimal data schemas for distribution evaluation.
 """
 
 from __future__ import annotations
-from typing import List, Optional
+from typing import Optional
 from pydantic import BaseModel
 
 from src.core.geometry import PitchPoint

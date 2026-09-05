@@ -156,3 +156,135 @@ def test_evaluate_all_options_structure():
     p3 = create_man_to_man_lock()
     assert len(p2.opponents) == 10
     assert len(p3.opponents) == 10
+
+
+def test_continuous_2d_spatial_turnover_hazard():
+    from src.physics.gk_constraints import (
+        CENTRAL_TURNOVER_PEAK_XG,
+        TURNOVER_HAZARD_FLOOR_XG,
+    )
+
+    evaluator = DistributionEvaluator()
+
+    # 1. Defending goal center (X=0, Y=34) when attacking left-to-right
+    h_goal_mouth = evaluator.compute_turnover_risk_cost(
+        PitchPoint(x=0.0, y=34.0), attack_dir_x=1.0
+    )
+    assert h_goal_mouth == pytest.approx(CENTRAL_TURNOVER_PEAK_XG, abs=1e-3)
+
+    # 2. Penalty box edge centrally (X=16.5, Y=34.0)
+    h_box_edge = evaluator.compute_turnover_risk_cost(
+        PitchPoint(x=16.5, y=34.0), attack_dir_x=1.0
+    )
+    assert 0.30 <= h_box_edge <= 0.35
+
+    # 3. Touchline at same depth (X=16.5, Y=0.0) -> heavily decayed by lateral Gaussian
+    h_touchline = evaluator.compute_turnover_risk_cost(
+        PitchPoint(x=16.5, y=0.0), attack_dir_x=1.0
+    )
+    assert h_touchline == pytest.approx(TURNOVER_HAZARD_FLOOR_XG, abs=1e-3)
+
+    # 4. Inverted attack direction (attacking right-to-left, own goal at X=105.0)
+    h_inverted_goal = evaluator.compute_turnover_risk_cost(
+        PitchPoint(x=105.0, y=34.0), attack_dir_x=-1.0
+    )
+    assert h_inverted_goal == pytest.approx(CENTRAL_TURNOVER_PEAK_XG, abs=1e-3)
+
+    h_inverted_box = evaluator.compute_turnover_risk_cost(
+        PitchPoint(x=105.0 - 16.5, y=34.0), attack_dir_x=-1.0
+    )
+    assert 0.30 <= h_inverted_box <= 0.35
+
+
+def test_exit_affordance_scaling():
+    evaluator = DistributionEvaluator()
+    origin = PitchPoint(x=5.0, y=34.0)
+    target = PitchPoint(x=35.0, y=34.0)
+
+    # Base threat with 0 exit lanes (pinned/constrained receiver)
+    t_pinned = evaluator.compute_progression_threat(
+        origin, target, opponents_pressed_count=1, exit_lanes_count=0
+    )
+
+    # Threat with 1 exit lane
+    t_single = evaluator.compute_progression_threat(
+        origin, target, opponents_pressed_count=1, exit_lanes_count=1
+    )
+
+    # Threat with 3 unblocked exit lanes
+    t_multi = evaluator.compute_progression_threat(
+        origin, target, opponents_pressed_count=1, exit_lanes_count=3
+    )
+
+    # Pinned should be discounted (0.75x) relative to single (1.00x) and multi (1.30x)
+    assert t_pinned < t_single < t_multi
+    assert t_single / t_pinned == pytest.approx(1.00 / 0.75, abs=1e-2)
+    assert t_multi / t_single == pytest.approx(1.30 / 1.00, abs=1e-2)
+
+
+def test_pressure_relief_value():
+    from src.physics.gk_constraints import (
+        GK_PRESS_URGENCY_RADIUS_M,
+        GK_PRESS_CRITICAL_RADIUS_M,
+    )
+
+    evaluator = DistributionEvaluator()
+    gk_pos = PitchPoint(x=5.0, y=34.0)
+    fullback_pos = PitchPoint(x=25.0, y=55.0)
+
+    origin_h = evaluator.compute_turnover_risk_cost(gk_pos, attack_dir_x=1.0)
+    target_h = evaluator.compute_turnover_risk_cost(fullback_pos, attack_dir_x=1.0)
+
+    # 1. Unpressed goalkeeper (> 8.0m): urgency is 0 -> relief is 0
+    relief_unpressed = evaluator.compute_pressure_relief_value(
+        origin_hazard=origin_h,
+        target_hazard=target_h,
+        gk_press_dist_m=GK_PRESS_URGENCY_RADIUS_M + 2.0,
+    )
+    assert relief_unpressed == 0.0
+
+    # 2. Heavily pressed goalkeeper (at critical radius <= 2.0m): maximum urgency
+    relief_critical = evaluator.compute_pressure_relief_value(
+        origin_hazard=origin_h,
+        target_hazard=target_h,
+        gk_press_dist_m=GK_PRESS_CRITICAL_RADIUS_M,
+    )
+    assert relief_critical > 0.30
+    assert relief_critical == pytest.approx(origin_h - target_h, abs=1e-3)
+
+    # 3. Intermediate press (e.g. 5.0m closing at 3.0 m/s): scaled relief
+    relief_inter = evaluator.compute_pressure_relief_value(
+        origin_hazard=origin_h,
+        target_hazard=target_h,
+        gk_press_dist_m=5.0,
+        closing_speed_ms=3.0,
+    )
+    assert 0.0 < relief_inter <= relief_critical
+
+    # 4. Net EV with relief produces positive value for viable open pass
+    prog_threat = evaluator.compute_progression_threat(
+        origin=gk_pos,
+        target=fullback_pos,
+        opponents_pressed_count=1,
+    )
+    net_ev = evaluator.compute_net_distribution_ev(
+        retention_xp=0.85,
+        prog_threat=prog_threat,
+        target_turnover_cost=target_h,
+        relief_value=relief_inter,
+    )
+    assert net_ev > 0.0
+
+
+def test_space_pass_and_off_screen_constants():
+    from src.physics.gk_constraints import (
+        OFF_SCREEN_DEFENDER_PRIOR_M,
+        SPACE_PASS_LATERAL_OFFSET_M,
+        RELEASE_EQUIVALENCE_DELTA_SCORE,
+        MIN_RECOMMENDED_SCORE,
+    )
+
+    assert OFF_SCREEN_DEFENDER_PRIOR_M == 14.0
+    assert SPACE_PASS_LATERAL_OFFSET_M == 2.0
+    assert RELEASE_EQUIVALENCE_DELTA_SCORE == 8.0
+    assert MIN_RECOMMENDED_SCORE == 50.0
