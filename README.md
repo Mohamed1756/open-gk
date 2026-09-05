@@ -1,6 +1,6 @@
 # GK Decision-Value Engine
 
-Early-stage exploration of goalkeeper distribution decision-making using computer vision.
+Goalkeeper distribution valuation and decision-making engine conditioned on opponent press geometry and physics.
 
 ## Images
 
@@ -8,16 +8,13 @@ Early-stage exploration of goalkeeper distribution decision-making using compute
 
 ![Keeper optimal distribution path](keeper_optimal_distribution_path.png)
 
-## The idea
+## Core Analytical Architecture
 
-Most GK stats (distribution % or pass completion) don't account for context—specifically, the positioning and intensity of the press. A perfectly safe sideways pass looks the same as a risky penetrating one. **The question:** Can we score a keeper's decision-making against the actual problem they face—the press—and separate "good at distribution" from "positioned well"?
-
-## What's here
-
-- **Video-based CV pipeline**: YOLO detection, multi-object tracking, pose estimation
-- **Press modeling**: detects pressuring players and their geometry relative to the ball carrier
-- **Decision scoring**: evaluates keeper actions against press profile and biomechanics
-- **Interactive dashboard**: HTML report with video sync and multi-episode switching
+- **Video-based CV pipeline**: YOLO detection, multi-object tracking, pitch homography, and pose estimation.
+- **Press geometry & kinematics**: Hungarian bipartite presser-to-outlet assignment and sprint burst acceleration vs decelerating Coulomb turf rolling friction ($\Delta t = t_{\text{press}} - t_{\text{receipt}}$).
+- **Multi-objective decision frontier**: Pareto optimization balancing defensive safety cushion ($\Delta t$) against net expected threat progression ($\Delta\text{xG}$), enforcing saturation caps, baseline clearance floors, raycast occlusion, and touchline survival decay.
+- **Continuous temporal passing windows**: 25 Hz sequence evaluation with differential separation kinematics ($\dot{d}_{\text{sep}}$), IFAB Law 11 kick-instant offside tracking, dynamic lateral interceptor detection, and decoupled physical moving-average smoothing.
+- **Quantitative cockpit dashboard**: Interactive multi-episode HTML report integrating SVG Pareto frontiers, spatial physics radar/occlusion maps, and synchronized video playback.
 
 ## Quick Start
 
@@ -26,13 +23,17 @@ git clone https://github.com/Mohamed1756/open-gk.git
 cd open-gk
 python3.11 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
-python scripts/evaluate_distribution.py --episode all
+pip install -r requirements.txt
+python3 scripts/evaluate_distribution.py --episode all
 open reports/goalkeeper_distribution_valuation.html
 ```
 
-## Status
+## Running Tests
 
-**Phase 0.** Proof-of-concept. Code is exploratory and rough. The goal is to validate whether the signal exists—can we measure keeper decision-making against the press?
+```bash
+pytest -x -q
+ruff check src/ tests/
+ruff format --check src/ tests/
+```
 
 
