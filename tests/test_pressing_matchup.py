@@ -2,7 +2,11 @@
 
 from src.core.geometry import PitchPoint
 from src.models.pressing.matchup import assign_pressers
-from src.models.pressing.types import PressingActor, PressingSnapshot
+from src.models.pressing.types import (
+    DefenderTaskKind,
+    PressingActor,
+    PressingSnapshot,
+)
 
 
 def _actor(tid, x, y, vx=0.0, vy=0.0, team="opp"):
@@ -68,3 +72,57 @@ def test_deterministic_repeated_runs():
     assert [(o.receiver_track_id, o.presser_track_id) for o in first.outlets] == [
         (o.receiver_track_id, o.presser_track_id) for o in second.outlets
     ]
+
+
+def test_every_opponent_leaves_with_a_task():
+    receivers = [_actor(9, 86.0, 25.0, team="own")]
+    opponents = [
+        _actor(21, 99.0, 29.0, team="opp"),  # on the ball: ball-press
+        _actor(22, 88.0, 27.0, vx=-4.0, vy=-2.0),  # converging: mark or surplus
+        _actor(23, 60.0, 29.0),  # 40m out, settled: deep, task NONE
+    ]
+    res = assign_pressers(_snap(receivers, opponents))
+    assert set(res.defender_tasks) == {21, 22, 23}
+    assert res.defender_tasks[21].kind is DefenderTaskKind.MAN
+    assert res.defender_tasks[21].target_id == "ball"
+    assert res.defender_tasks[22].kind is DefenderTaskKind.MAN
+    deep = res.defender_tasks[23]
+    assert deep.kind is DefenderTaskKind.NONE
+    assert deep.reason == "deep-beyond-horizon"
+
+
+def test_surplus_converger_gets_man_task():
+    receivers = [_actor(9, 86.0, 25.0, team="own")]
+    opponents = [
+        _actor(21, 99.0, 29.0, team="opp"),
+        _actor(22, 82.0, 24.0, vx=3.0, vy=1.0),
+        _actor(23, 70.0, 20.0, vx=5.0, vy=2.0),
+    ]
+    res = assign_pressers(_snap(receivers, opponents))
+    man_tasks = [
+        t for t in res.defender_tasks.values() if t.kind is DefenderTaskKind.MAN
+    ]
+    # Ball-press plus mark plus the surplus converger: nobody vanishes.
+    assert len(man_tasks) == 3
+    surplus = [
+        t for t in res.defender_tasks.values() if t.reason == "surplus-converger"
+    ]
+    assert len(surplus) >= 1
+
+
+def test_split_stance_covers_two_lanes():
+    receivers = [
+        _actor(9, 88.0, 27.0, team="own"),
+        _actor(5, 88.0, 31.0, team="own"),
+    ]
+    opponents = [
+        _actor(21, 99.0, 29.0, team="opp"),
+        _actor(24, 89.0, 27.5, team="opp"),
+        _actor(25, 89.0, 30.5, team="opp"),
+        _actor(22, 97.0, 29.0),  # settled where both corridors converge
+    ]
+    res = assign_pressers(_snap(receivers, opponents))
+    task = res.defender_tasks[22]
+    assert task.kind is DefenderTaskKind.LANE
+    assert task.weight + task.second_weight == 1.0
+    assert task.second_target_id is not None

@@ -20,6 +20,7 @@ from src.physics.biomechanics import (
     compute_biomechanical_execution_penalty,
     compute_hip_pivot_latency,
 )
+from src.physics.gk_constraints import RECEIVER_FIRST_TOUCH_LATENCY_S
 
 VELOCITY_FACING_FLOOR_MS = 0.5
 UNKNOWN_FACING_MULTIPLIER = 0.85
@@ -35,6 +36,10 @@ class ReadinessResult:
     turn_latency_s: float
     facing_source: str
     note: str
+    reception_latency_s: float = RECEIVER_FIRST_TOUCH_LATENCY_S
+
+    def post_cushion_s(self, arrival_margin_s: float) -> float:
+        return round(arrival_margin_s - self.reception_latency_s, 3)
 
 
 def resolve_facing(
@@ -87,10 +92,12 @@ def receiver_readiness(
     if source == "unknown":
         mult *= UNKNOWN_FACING_MULTIPLIER
         note += "+unknown-facing"
+    reception_latency = round(RECEIVER_FIRST_TOUCH_LATENCY_S + turn_latency, 3)
     return ReadinessResult(
         receiver_track_id=receiver.track_id,
         readiness_mult=round(max(0.2, mult), 3),
         turn_latency_s=round(turn_latency, 3),
         facing_source=source,
         note=note,
+        reception_latency_s=reception_latency,
     )
